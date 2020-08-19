@@ -47,8 +47,12 @@ class Env(gym.Env):
         self.nb_saccades = 6
         #self.new_crop()
 
+        self.stats = np.array([[0 for i in range(5)] for j in range(5)])
+        self.stats_count = 0
+
     def new_image(self):
         self.index = (self.index+1)%60000
+        self.index = np.random.randint(60000)
         self.image = self.train_img[self.index]
         self.label = self.train_lbl[self.index]
         
@@ -73,11 +77,26 @@ class Env(gym.Env):
         
     def step(self,action):
         self.crop_pos = (action[10:12]+1)/2
+        [x,y] = self.crop_pos
+        if x == 1:
+            x = 0.999
+        if y == 1:
+            y = 0.999
+        self.stats[int(y*5)][int(x*5)] += 1
+        self.stats_count += 1
+        if self.stats_count == 256*20:
+            self.stats = self.stats/np.sum(self.stats)*100
+            self.stats = self.stats.astype(int)
+            print("---",self.crop_pos)
+            print(self.stats)
+            self.stats = self.stats*0
+            self.stats_count = 0
+        #self.crop_pos = [0.5,0.5]
         cl = action[:10]
         index = np.argmax(cl)
         self.new_crop()
         done = self.nb_crop==self.nb_saccades
-        reward = int(index == self.label)
+        reward = int(index == self.label)*done
         return self.crop,reward,done,{"label":self.label}
         
     def reset(self):
@@ -107,8 +126,8 @@ def make_model(policy,obs_space,action_space,model_config):
             c_o2 = tf.keras.layers.Dense(10,activation="softmax",name='dc_o2')(lstm2)
             
             #Saccader output
-            s_o1 = tf.keras.layers.Dense(2,activation="tanh",name='ds_o1')(lstm2)
-            s_o2 = tf.keras.layers.Dense(2,activation="tanh",name='ds_o2')(lstm2)
+            s_o1 = tf.keras.layers.Dense(2,activation="tanh",name='ds_o1')(tf.stop_gradient(lstm2))
+            s_o2 = tf.keras.layers.Dense(2,activation="tanh",name='ds_o2')(tf.stop_gradient(lstm2))
             
             #Value output
             v = tf.keras.layers.Dense(1,activation=None,name='dv')(lstm2)
@@ -122,15 +141,15 @@ def make_model(policy,obs_space,action_space,model_config):
             inp = inp[:,:,:-1]
             #Compute the model
             m_out,self.m_val,*state = self.model([inp,*state])
-            c_o1 = m_out[:,0:10]
-            s_o1 = m_out[:,10:12]
-            c_o2 = m_out[:,12:22]
-            s_o2 = m_out[:,22:24]
+            c_o1 = m_out[:,:,0:10]
+            s_o1 = m_out[:,:,10:12]
+            c_o2 = m_out[:,:,12:22]
+            s_o2 = m_out[:,:,22:24]
             #Cut logstd
-            c_o2 = c_o2*0-1e3
-            s_o2 = s_o2*0-1e3
+            c_o2 = c_o2*0-1e1
+            s_o2 = s_o2*0-1e1
             #Prepare output
-            m_out = tf.concat([c_o1,s_o1,c_o2,s_o2],axis=1)
+            m_out = tf.concat([c_o1,s_o1,c_o2,s_o2],axis=2)
             return m_out,state
         @override(ModelV2)
         def get_initial_state(self):
@@ -142,19 +161,35 @@ def make_model(policy,obs_space,action_space,model_config):
     num_outputs = 24
     return KerasModel(obs_space,action_space,num_outputs,model_config,"keras_model")
 
+from ray.rllib.agents.ppo.ppo_tf_policy import *
+class KLCoeffMixin:
+    def __init__(self, config):
+        # KL Coefficient
+        self.kl_coeff_val = config["kl_coeff"]
+        self.kl_target = config["kl_target"]
+        self.kl_coeff = tf.get_variable(
+            initializer=tf.constant_initializer(self.kl_coeff_val),
+            name="kl_coeff",
+            shape=(),
+            trainable=False,
+            dtype=tf.float32)
+
+    def update_kl(self, sampled_kl):
+        return self.kl_coeff_val
+    
 def cut_gradient(tensor,slices):
     t_list = []
     for begin,end,stop in slices:
         t = tensor[:,begin:end]
         if stop:
-            _t = tf.stop_gradient(t)
+            _t = tf.stop_gradient(t)*0
         else:
             _t = t
         t_list.append(_t)
     return tf.concat(t_list,axis=1)
       
 
-def ppo_surrogate_loss(policy, model, dist_class, train_batch):
+def _ppo_surrogate_loss(policy, model, dist_class, train_batch):
     logits, state = model.from_batch(train_batch)
     logits = cut_gradient(logits,[(0,10,True),(10,12,False),(12,22,True),(22,24,True)])
     action_dist = dist_class(logits, model)
@@ -187,29 +222,31 @@ def ppo_surrogate_loss(policy, model, dist_class, train_batch):
 
     return policy.loss_obj.loss
 
-from ray.rllib.agents.ppo.ppo_tf_policy import *
 def branch_loss(policy,model,dist_class,train_batch):
     #PPO Loss
-    ppo_loss = ppo_surrogate_loss(policy,model,dist_class,train_batch)
+    ppo_loss = _ppo_surrogate_loss(policy,model,dist_class,train_batch)
     #Classifier Loss
     labels = train_batch[SampleBatch.CUR_OBS][:,-1]
-        
     out, state = model.from_batch(train_batch)
+    dist = dist_class(out,model)
+    out = dist.sample()
     pred = out[:,:10]
     #Mnih backprop ---------
-    #labels = labels[nb_saccades-1::nb_saccades]
-    #pred = pred[nb_saccades-1::nb_saccades]
+    labels = labels[nb_saccades-1::nb_saccades]
+    pred = pred[nb_saccades-1::nb_saccades]
     #-----------------------
     
     cl_loss = tf.keras.losses.sparse_categorical_crossentropy(labels,pred)
     cl_loss = tf.reduce_mean(cl_loss)
+    #cl_loss = tf.Print(cl_loss,[cl_loss,ppo_loss],"--",summarize=-1)
+    cl_loss = cl_loss*0.5
     return cl_loss + ppo_loss
     
 BranchPolicy = build_tf_policy(
     name="PPOTFPolicy",
     make_model = make_model, #Give the model
     get_default_config=lambda: ray.rllib.agents.ppo.ppo.DEFAULT_CONFIG, #Default ppo config
-    loss_fn=branch_loss,#ppo_surrogate_loss,
+    loss_fn=branch_loss,
     stats_fn=kl_and_loss_stats,
     extra_action_fetches_fn=vf_preds_fetches,
     postprocess_fn=postprocess_ppo_gae,
@@ -224,10 +261,10 @@ BranchPolicy = build_tf_policy(
 config = {'gamma': 0.9,
           #'lr': 1e-2,
           'num_workers': 4,
-          'train_batch_size': 256*4,
+          'train_batch_size': 256*4*8,
 }
 ppo_config= DEFAULT_CONFIG.copy()
-ppo_config["rollout_fragment_length"] = 256
+ppo_config["rollout_fragment_length"] = 256*2
 trainer = build_trainer(name="BranchTrainer",
                         #default_policy=PPOTFPolicy,
                         default_policy=BranchPolicy,
@@ -237,6 +274,10 @@ trainer = build_trainer(name="BranchTrainer",
 trainer = trainer(config=config,env=Env)#"CartPole-v1")
 
 if __name__ == "__main__":
-    for i in range(100):
-        res = trainer.train()
-        print(i,res["episode_reward_mean"]/res["episode_len_mean"])
+    print(trainer.workers._local_worker.policy_map["default_policy"].get_weights()["default_policy/dc_o1/kernel"][0,0])
+    for i in range(1000):
+        for j in range(10):
+            res = trainer.train()
+            print(i*10+j,int(res["episode_reward_mean"]*100))
+        print("saved - ",trainer.save())
+    print(trainer.workers._local_worker.policy_map["default_policy"].get_weights()["default_policy/dc_o1/kernel"][0,0])
