@@ -1,0 +1,6 @@
+tensorflow
+ray==0.8.4
+gym
+dm_tree
+pandas
+ray[rllib]
